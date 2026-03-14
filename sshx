@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SSHX_VERSION="3.0"
+SSHX_LISENCE="GPL-3.0"
+
+SSHX_HOME="${SSHX_HOME:-$HOME/.sshx}"
+SSH_HOME="${SSH_HOME:-$HOME/.ssh}"
+
+SSHX_CONNECTIONS_DIR="$SSHX_HOME/connections"
+SSHX_BACKUPS_DIR="$SSHX_HOME/backups"
+SSHX_TAGS_DIR="$SSHX_HOME/tags"
+SSHX_CONFIG="$SSHX_HOME/config"
+SSH_CONFIG="$SSH_HOME/config"
+
+# Source library files
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/lib"
+
+# shellcheck source=lib/output.sh
+source "$LIB_DIR/output.sh"
+# shellcheck source=lib/config.sh
+source "$LIB_DIR/config.sh"
+# shellcheck source=lib/connection.sh
+source "$LIB_DIR/connection.sh"
+# shellcheck source=lib/tags.sh
+source "$LIB_DIR/tags.sh"
+# shellcheck source=lib/importexport.sh
+source "$LIB_DIR/importexport.sh"
+# shellcheck source=lib/completion.sh
+source "$LIB_DIR/completion.sh"
+
+# ─── Dispatch ───────────────────────────────────────────────────────────────
+
+cmd_help() {
+  cat <<EOF
+$(color bold)sshx$(color reset) — Advanced SSH Connection Manager v$SSHX_VERSION
+
+$(color bold)Usage:$(color reset) sshx <command> [options]
+
+$(color bold)Connections:$(color reset)
+  $(color cyan)connect$(color reset)               NAME [SSH_ARGS...]     Connect to a saved host   (alias: ssh, c)
+  $(color cyan)search$(color reset)                TERM [options]         Search connections        (alias: find, f)
+  $(color cyan)list$(color reset)                  [options]              List all connections      (alias: ls)
+
+  $(color cyan)connection$(color reset) add        NAME USER@HOST[:PORT]  Create connection         (alias: new, create, a)
+  $(color cyan)connection$(color reset) edit       NAME                   Edit in \$EDITOR           (alias: e)
+  $(color cyan)connection$(color reset) set        NAME [options]         Update parameters         (alias: update, u)
+  $(color cyan)connection$(color reset) remove     NAME                   Delete connection         (alias: rm, delete, del)
+  $(color cyan)connection$(color reset) show       NAME                   Show details              (alias: info, i)
+  $(color cyan)connection$(color reset) rename     OLD NEW                Rename                    (alias: mv)
+  $(color cyan)connection$(color reset) copy       SOURCE NEW             Duplicate                 (alias: cp, clone)
+  $(color cyan)connection$(color reset) check      NAME                   Validate & ping           (alias: ping)
+  $(color cyan)connection$(color reset) effective  NAME                   Show effective SSH config (alias: config, cfg)
+
+$(color bold)Tags:$(color reset)
+  $(color cyan)tag$(color reset) add               TAG[,TAG2]             Add tags to connection
+  $(color cyan)tag$(color reset) remove            NAME TAG[,TAG2]        Remove tags from connection
+  $(color cyan)tag$(color reset) list                                     List all tags with counts
+  $(color cyan)tag$(color reset) rename            OLD NEW                Rename tag everywhere
+
+$(color bold)Transfers:$(color reset)
+  $(color cyan)export$(color reset)                NAME [FILE]            Export one connection
+  $(color cyan)export$(color reset) --all          FILE                   Export all connections
+  $(color cyan)import$(color reset)                [FILE]                 Import connections
+
+$(color bold)Base:$(color reset)
+  $(color cyan)init$(color reset)                                         Initialize ~/.sshx
+  $(color cyan)config$(color reset) set            KEY VALUE              Set sshx setting
+  $(color cyan)config$(color reset) get            [KEY]                  Show sshx setting(s)
+  $(color cyan)completion$(color reset)            bash|zsh|fish          Print completion script
+  $(color cyan)version$(color reset)                                      Show version
+  $(color cyan)license$(color reset)                                      Show license
+  $(color cyan)help$(color reset)                                         Show help
+
+Run $(color bold)sshx COMMAND --help$(color reset) for command-specific help.
+EOF
+}
+
+cmd_version() {
+  echo "$SSHX_VERSION"
+}
+
+cmd_license() {
+  echo "$SSHX_LISENCE"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    # Top-level verbs
+    connect|c)		cmd_connect "$@" 	  ;;
+    check|ping)		cmd_connection_check "$@" ;;
+    list|ls)            cmd_list "$@" 		  ;;
+    search|find|f)      cmd_search "$@" 	  ;;
+
+    # connection sub-group
+    connection|conn)
+      local sub="${1:-}"
+      shift || true
+      case "$sub" in
+        add|new|create|a)  cmd_connection_add "$@" ;;
+        edit|e)            cmd_connection_edit "$@" ;;
+        set|update|u)      cmd_connection_set "$@" ;;
+        remove|rm|delete|del) cmd_connection_remove "$@" ;;
+        show|info|i)       cmd_connection_show "$@" ;;
+        rename|mv)         cmd_connection_rename "$@" ;;
+        copy|cp|clone)     cmd_connection_copy "$@" ;;
+        check|validate|ping|v) cmd_connection_check "$@" ;;
+        effective|config|cfg)  cmd_connection_effective "$@" ;;
+        --help|-h)         cmd_help ;;
+        *) die "Unknown connection subcommand: '$sub'. Run 'sshx help'." ;;
+      esac
+      ;;
+      
+
+    # tag sub-group
+    tag)
+      local sub="${1:-}"
+      shift || true
+      case "$sub" in
+        add)     cmd_tag_add "$@" ;;
+        remove)  cmd_tag_remove "$@" ;;
+        list)    cmd_tag_list "$@" ;;
+        rename)  cmd_tag_rename "$@" ;;
+        --help|-h) cmd_help ;;
+        *) die "Unknown tag subcommand: '$sub'. Run 'sshx help'." ;;
+      esac
+      ;;
+
+    # import/export
+    export)  cmd_export "$@" ;;
+    import)  cmd_import "$@" ;;
+
+    # config
+    config)
+      local sub="${1:-get}"
+      shift || true
+      case "$sub" in
+        set) cmd_config_set "$@" ;;
+        get) cmd_config_get "$@" ;;
+        --help|-h) cmd_help ;;
+        *) die "Unknown config subcommand: '$sub'." ;;
+      esac
+      ;;
+
+    # misc
+    init)        cmd_init "$@" 			;;
+    completion)  cmd_completion "$@" 		;;
+    version|--version|-V) cmd_version 		;;
+    license|--lisence|-L) cmd_license "$@"	;;
+    help|--help|-h) cmd_help 			;;
+    *) die "Unknown command: '$cmd'. Run 'sshx help'." ;;
+  esac
+}
+
+main "$@"
