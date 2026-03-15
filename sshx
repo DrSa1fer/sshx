@@ -1,159 +1,1457 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-SSHX_VERSION="3.0"
-SSHX_LISENCE="GPL-3.0"
-
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+  printf 'bash >= 4.3 required\n' >&2
+  exit 1
+fi
+SSHX_VERSION="4.1"
+SSHX_LICENSE="GPL-3.0"
 SSHX_HOME="${SSHX_HOME:-$HOME/.sshx}"
 SSH_HOME="${SSH_HOME:-$HOME/.ssh}"
-
+SSH_BIN="${SSH_BIN:-ssh}"
 SSHX_CONNECTIONS_DIR="$SSHX_HOME/connections"
 SSHX_BACKUPS_DIR="$SSHX_HOME/backups"
 SSHX_TAGS_DIR="$SSHX_HOME/tags"
 SSHX_CONFIG="$SSHX_HOME/config"
 SSH_CONFIG="$SSH_HOME/config"
+declare -A SSH_FLAG_MAP=(
+  [host]=HostName [user]=User [port]=Port [address-family]=AddressFamily
+  [bind-address]=BindAddress [connect-timeout]=ConnectTimeout [identity]=IdentityFile
+  [identity-agent]=IdentityAgent [pubkey-auth]=PubkeyAuthentication [password-auth]=PasswordAuthentication
+  [kbd-interactive]=KbdInteractiveAuthentication [gssapi-auth]=GSSAPIAuthentication [gssapi-delegate]=GSSAPIDelegateCredentials
+  [preferred-auth]=PreferredAuthentications [host-based-auth]=HostbasedAuthentication [number-of-password-prompts]=NumberOfPasswordPrompts
+  [strict-host-key-checking]=StrictHostKeyChecking [known-hosts]=UserKnownHostsFile [global-known-hosts]=GlobalKnownHostsFile
+  [host-key-algorithms]=HostKeyAlgorithms [check-host-ip]=CheckHostIP [verify-host-key-dns]=VerifyHostKeyDNS [revoked-host-keys]=RevokedHostKeys
+  [ciphers]=Ciphers [macs]=MACs [kex-algorithms]=KexAlgorithms [pubkey-accepted-algorithms]=PubkeyAcceptedAlgorithms
+  [ca-signature-algorithms]=CASignatureAlgorithms [required-rsa-size]=RequiredRSASize [jump]=ProxyJump [proxy-command]=ProxyCommand
+  [local-forward]=LocalForward [remote-forward]=RemoteForward [dynamic-forward]=DynamicForward [exit-on-forward-failure]=ExitOnForwardFailure
+  [clear-all-forwardings]=ClearAllForwardings [control-master]=ControlMaster [control-path]=ControlPath [control-persist]=ControlPersist
+  [server-alive-interval]=ServerAliveInterval [server-alive-count-max]=ServerAliveCountMax [tcp-keepalive]=TCPKeepAlive [forward-agent]=ForwardAgent
+  [forward-x11]=ForwardX11 [forward-x11-trusted]=ForwardX11Trusted [forward-x11-timeout]=ForwardX11Timeout [request-tty]=RequestTTY [send-env]=SendEnv
+  [set-env]=SetEnv [accept-env]=AcceptEnv [remote-command]=RemoteCommand [permit-local-command]=PermitLocalCommand [local-command]=LocalCommand
+  [compression]=Compression [log-level]=LogLevel [escape-char]=EscapeChar [hash-known-hosts]=HashKnownHosts [add-keys-to-agent]=AddKeysToAgent
+  [rekey-limit]=RekeyLimit [session-type]=SessionType [stdin-null]=StdinNull [fork-after-authentication]=ForkAfterAuthentication [tunnel]=Tunnel
+  [tunnel-device]=TunnelDevice [permit-remote-open]=PermitRemoteOpen [security-key-provider]=SecurityKeyProvider [pkcs11-provider]=PKCS11Provider
+  [ignored-unknown]=IgnoredUnknownOption
+)
+_check_deps() {
+  local missing=()
+  for _cmd in awk sort find mktemp tr; do
+    command -v "$_cmd" &>/dev/null || missing+=("$_cmd")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || { printf 'sshx: missing required tools: %s\n' "${missing[*]}" >&2; exit 1; }
+}
+_check_deps
 
-# Source library files
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="$SCRIPT_DIR/lib"
+_use_color() {
+  [[ "${NO_COLOR:-}" == "1" ]] && return 1
+  [[ "${FORCE_COLOR:-}" == "1" ]] && return 0
+  [[ -t 1 ]]
+}
+color() {
+  _use_color || return 0
+  case "$1" in
+    reset) printf '\033[0m' ;;
+    bold) printf '\033[1m' ;;
+    red) printf '\033[31m' ;;
+    green) printf '\033[32m' ;;
+    yellow) printf '\033[33m' ;;
+    cyan) printf '\033[36m' ;;
+    gray) printf '\033[90m' ;;
+  esac
+}
+die() { printf '%s✗ %s%s\n' "$(color red)" "$*" "$(color reset)" >&2; exit 1; }
+ok()  { printf '%s✓ %s%s\n' "$(color green)" "$*" "$(color reset)"; }
+info(){ printf '%s· %s%s\n' "$(color cyan)" "$*" "$(color reset)"; }
+warn(){ printf '%s⚠ %s%s\n' "$(color yellow)" "$*" "$(color reset)" >&2; }
+confirm() {
+  local prompt="${1:-Are you sure?}" reply
+  printf '%s%s [y/N] %s' "$(color yellow)" "$prompt" "$(color reset)" >&2
+  read -r reply </dev/tty
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+print_table() {
+  local no_header=false
+  [[ "${1:-}" == "--no-header" ]] && no_header=true
+  if ! command -v column &>/dev/null; then cat; return; fi
+  if "$no_header"; then
+    column -t -s $'\t'
+  else
+    local first=true line
+    while IFS= read -r line; do
+      if "$first"; then
+        first=false
+        _use_color && printf '\033[1m%s\033[0m\n' "$line" || printf '%s\n' "$line"
+      else
+        printf '%s\n' "$line"
+      fi
+    done | column -t -s $'\t'
+  fi
+}
+_LOCK_ACQUIRED=false
+check_lock() {
+  mkdir -p "$SSHX_HOME"
+  if command -v flock &>/dev/null; then
+    exec 200>"$SSHX_HOME/.lock"
+    flock -n 200 || die "Could not acquire lock. Another sshx is running."
+  else
+    local lockdir="$SSHX_HOME/.lock.d"
+    local retries=0
+    until mkdir "$lockdir" 2>/dev/null; do
+      (( retries++ > 10 )) && die "Could not acquire lock. Another sshx is running."
+      sleep 0.2
+    done
+    printf '%s' "$$" > "$lockdir/pid"
+  fi
+  _LOCK_ACQUIRED=true
+}
+release_lock() {
+  if command -v flock &>/dev/null; then
+    flock -u 200 2>/dev/null || true
+  else
+    rm -rf "$SSHX_HOME/.lock.d" 2>/dev/null || true
+  fi
+  _LOCK_ACQUIRED=false
+}
+declare -a _TEMP_FILES=()
+_cleanup() {
+  local f
+  for f in "${_TEMP_FILES[@]:-}"; do rm -f "$f" 2>/dev/null; done
+  [[ "$_LOCK_ACQUIRED" == true ]] && release_lock 2>/dev/null || true
+}
+trap _cleanup EXIT INT TERM HUP
 
-# shellcheck source=lib/output.sh
-source "$LIB_DIR/output.sh"
-# shellcheck source=lib/config.sh
-source "$LIB_DIR/config.sh"
-# shellcheck source=lib/connection.sh
-source "$LIB_DIR/connection.sh"
-# shellcheck source=lib/tags.sh
-source "$LIB_DIR/tags.sh"
-# shellcheck source=lib/importexport.sh
-source "$LIB_DIR/importexport.sh"
-# shellcheck source=lib/completion.sh
-source "$LIB_DIR/completion.sh"
-
-# ─── Dispatch ───────────────────────────────────────────────────────────────
-
-cmd_help() {
+atomic_write() {
+  local dest="$1" tmp
+  tmp=$(mktemp "${dest}.XXXXXX")
+  _TEMP_FILES+=("$tmp")
+  chmod 600 "$tmp"
+  cat > "$tmp"
+  mv "$tmp" "$dest"
+  # Remove from temp list after successful mv
+  local new=()
+  local f; for f in "${_TEMP_FILES[@]:-}"; do [[ "$f" != "$tmp" ]] && new+=("$f"); done
+  _TEMP_FILES=("${new[@]:-}")
+}
+declare -A DEFAULT_CFG=(
+  [backup_enabled]=true
+  [backup_max_age_days]=30
+  [color]=1
+  [fzf_preview]=false
+  [default_tags]=""
+  [editor]="${EDITOR:-vim}"
+)
+cfg_get() {
+  local key="$1" default="${2:-}" result
+  if [[ -f "$SSHX_CONFIG" ]]; then
+    result=$(awk -F'=' -v k="$key" '$1==k{print substr($0,index($0,"=")+1); exit}' "$SSHX_CONFIG" 2>/dev/null)
+    if [[ -n "$result" ]]; then
+      printf '%s' "$result"
+    else
+      printf '%s' "${default:-${DEFAULT_CFG[$key]:-}}"
+    fi
+  else
+    printf '%s' "${default:-${DEFAULT_CFG[$key]:-}}"
+  fi
+}
+cfg_set() {
+  local key="$1" value="$2"
+  mkdir -p "$(dirname "$SSHX_CONFIG")"
+  touch "$SSHX_CONFIG"
+  local tmp; tmp=$(mktemp)
+  _TEMP_FILES+=("$tmp")
+  awk -v k="$key" -v v="$value" '
+    $0 ~ ("^" k "=") { print k "=" v; seen=1; next }
+    { print }
+    END { if (!seen) print k "=" v }
+  ' "$SSHX_CONFIG" > "$tmp"
+  mv "$tmp" "$SSHX_CONFIG"
+  _TEMP_FILES=("${_TEMP_FILES[@]/$tmp}")
+}
+cmd_config_get() {
+  local key="${1:-}"
+  if [[ -n "$key" ]]; then
+    cfg_get "$key"; printf '\n'
+  else
+    local keys=(editor backup_enabled backup_max_age_days color fzf_preview default_tags)
+    for k in "${keys[@]}"; do printf '%-26s %s\n' "$k" "$(cfg_get "$k")"; done
+  fi
+}
+cmd_config_set() {
+  [[ $# -ge 2 ]] || die "Usage: sshx config set KEY VALUE"
+  cfg_set "$1" "$2"; ok "Set $1=$2"
+}
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%SZ; }
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\b'/\\b}"
+  s="${s//$'\f'/\\f}"
+  # Strip remaining ASCII control characters (U+0000–U+001F)
+  s=$(printf '%s' "$s" | tr -d '\000-\037' 2>/dev/null || printf '%s' "$s")
+  printf '%s' "$s"
+}
+parse_conn_string() {
+  local cs="$1"
+  local -n _pu="$2" _ph="$3" _pp="$4"
+  _pu="" _ph="" _pp="22"
+  [[ "$cs" == *"@"* ]] && { _pu="${cs%%@*}"; cs="${cs#*@}"; }
+  if [[ "$cs" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then _ph="${BASH_REMATCH[1]}"; _pp="${BASH_REMATCH[2]}"
+  elif [[ "$cs" =~ ^\[([^\]]+)\]$ ]]; then _ph="${BASH_REMATCH[1]}"
+  elif [[ "$cs" =~ ^([^:]+):([0-9]+)$ ]]; then _ph="${BASH_REMATCH[1]}"; _pp="${BASH_REMATCH[2]}"
+  else _ph="$cs"; fi
+}
+# Single-pass parser: reads all fields from one conn file in one awk invocation
+# Outputs: name TAB host TAB port TAB user TAB desc TAB tags TAB created TAB updated
+_parse_conn_file_fields() {
+  local file="$1"
+  awk '
+    /^# sshx:name=/       { name   = substr($0, index($0,"=")+1) }
+    /^# sshx:description=/{ desc   = substr($0, index($0,"=")+1) }
+    /^# sshx:tags=/       { tags   = substr($0, index($0,"=")+1) }
+    /^# sshx:created_at=/ { created= substr($0, index($0,"=")+1) }
+    /^# sshx:updated_at=/ { updated= substr($0, index($0,"=")+1) }
+    /^[[:space:]]*HostName[[:space:]]/ { host = $2 }
+    /^[[:space:]]*Port[[:space:]]/     { port = $2 }
+    /^[[:space:]]*User[[:space:]]/     { user = $2 }
+    END {
+      if (!port)    port    = "22"
+      if (!user)    user    = "-"
+      if (!desc)    desc    = "-"
+      if (!tags)    tags    = "-"
+      if (!created) created = "-"
+      if (!updated) updated = "-"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, host, port, user, desc, tags, created, updated
+    }
+  ' "$file"
+}
+conn_files() {
+  shopt -s nullglob
+  local f
+  for f in "$SSHX_CONNECTIONS_DIR"/*.conf; do printf '%s\n' "$f"; done | sort
+  shopt -u nullglob
+}
+conn_meta() {
+  local file="$1" field="$2"
+  awk -F'=' -v f="$field" 'BEGIN{pat="# sshx:" f "="} index($0,pat)==1{print substr($0,length(pat)+1); exit}' "$file" 2>/dev/null || true
+}
+conn_ssh() {
+  local file="$1" key="$2"
+  local key_lower; key_lower=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
+  awk -v k="$key_lower" '
+    /^[[:space:]]*[^#]/ {
+      if (tolower($1) == "host") { inhost = 1 }
+      if (inhost && tolower($1) == k) { print $2; exit }
+    }
+  ' "$file" 2>/dev/null || true
+}
+conn_file() {
+    printf '%s/%s.conf' "$SSHX_CONNECTIONS_DIR" "$1"
+}
+conn_validate_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] || { printf 'Invalid name "%s". Use [a-zA-Z0-9._-] only.\n' "$1" >&2; return 1; }
+}
+conn_validate_name_or_die() {
+  conn_validate_name "$1" || die "Invalid name '${1}'. Use [a-zA-Z0-9._-] only."
+}
+write_conn_file() {
+  local file="$1" name="$2" conn_str="$3"
+  local description="${4:-}" tags="${5:-}" created_at="${6:-}"
+  local now; now=$(utc_now)
+  [[ -n "$created_at" ]] || created_at="$now"
+  local def_tags; def_tags=$(cfg_get default_tags)
+  if [[ -n "$def_tags" ]]; then
+    # Merge and deduplicate tags + default_tags
+    local -A _seen=()
+    local -a _merged=()
+    local _t _all="${tags},${def_tags}"
+    IFS=',' read -ra _arr <<< "$_all"
+    for _t in "${_arr[@]}"; do
+      _t="${_t//[[:space:]]/}"
+      [[ -z "$_t" || -n "${_seen[$_t]:-}" ]] && continue
+      _seen[$_t]=1; _merged+=("$_t")
+    done
+    tags=$(IFS=','; printf '%s' "${_merged[*]:-}")
+  fi
+  local user host port
+  parse_conn_string "$conn_str" user host port
+  {
+    printf '# sshx:name=%s\n' "$name"
+    [[ -n "$description" ]] && printf '# sshx:description=%s\n' "$description"
+    [[ -n "$tags" ]] && printf '# sshx:tags=%s\n' "$tags"
+    printf '# sshx:created_at=%s\n' "$created_at"
+    printf '# sshx:updated_at=%s\n' "$now"
+    printf '# sshx:connection_string=%s\n' "$conn_str"
+    printf '\n'
+    printf 'Host %s\n' "$name"
+    printf '    HostName %s\n' "$host"
+    [[ -n "$user" ]] && printf '    User %s\n' "$user"
+    [[ "$port" != "22" && -n "$port" ]] && printf '    Port %s\n' "$port"
+  } | atomic_write "$file"
+  chmod 600 "$file"
+}
+update_meta() {
+  local file="$1" field="$2" value="$3" tmp
+  tmp=$(mktemp); chmod 600 "$tmp"
+  if awk -v f="$field" 'BEGIN{pat="# sshx:" f "="} index($0,pat)==1{print; found=1; next} {print} END{if(!found) exit 2}' "$file" >/dev/null 2>&1; then
+    awk -v f="$field" -v v="$value" 'BEGIN{pat="# sshx:" f "="} index($0,pat)==1{sub(/^# sshx:[^=]+=.*/,"# sshx:" f "=" v)} {print}' "$file" > "$tmp"
+  else
+    awk -v f="$field" -v v="$value" 'BEGIN{done=0} /^# sshx:/ && !done{print; print "# sshx:" f "=" v; done=1; next} {print}' "$file" > "$tmp"
+  fi
+  mv "$tmp" "$file"; chmod 600 "$file"
+}
+update_ssh_directive() {
+  local file="$1" directive="$2" value="$3" tmp hname
+  hname=$(awk -F'=' '/^# sshx:name=/{print substr($0,index($0,"=")+1); exit}' "$file" 2>/dev/null || true)
+  local dir_lower; dir_lower=$(printf '%s' "$directive" | tr '[:upper:]' '[:lower:]')
+  tmp=$(mktemp); _TEMP_FILES+=("$tmp"); chmod 600 "$tmp"
+  awk -v hname="$hname" -v d="$directive" -v dlo="$dir_lower" -v v="$value" '
+  BEGIN{inblock=0; done=0}
+  {
+    if(tolower($1)=="host"){
+      if(inblock && !done){ printf "    %s %s\n", d, v; done=1 }
+      inblock=0
+      if($2==hname) inblock=1
+      print; next
+    }
+    if(inblock){
+      line=$0; gsub(/^[[:space:]]+/,"",line)
+      split(line, arr, /[[:space:]]+/)
+      if(tolower(arr[1])==dlo){ printf "    %s %s\n", d, v; done=1; next }
+    }
+    print
+  }
+  END{ if(inblock && !done) printf "    %s %s\n", d, v }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"; chmod 600 "$file"
+}
+remove_ssh_directive() {
+  local file="$1" directive="$2" tmp
+  local dir_lower; dir_lower=$(printf '%s' "$directive" | tr '[:upper:]' '[:lower:]')
+  tmp=$(mktemp); _TEMP_FILES+=("$tmp"); chmod 600 "$tmp"
+  awk -v dlo="$dir_lower" '{
+    line=$0; gsub(/^[[:space:]]+/,"",line)
+    split(line, a, /[[:space:]]+/)
+    if(tolower(a[1])==dlo) next
+    print
+  }' "$file" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file"; chmod 600 "$file"
+}
+touch_updated() { update_meta "$1" updated_at "$(utc_now)"; }
+backup_conn() {
+  [[ "$(cfg_get backup_enabled)" == "true" ]] || return 0
+  [[ -f "$1" ]] || return 0
+  local ts; ts=$(utc_now | tr -d ':-')
+  mkdir -p "$SSHX_BACKUPS_DIR"
+  cp "$1" "${SSHX_BACKUPS_DIR}/$(basename "$1").${ts}"
+}
+backups_prune() {
+  local max; max=$(cfg_get backup_max_age_days)
+  [[ -d "$SSHX_BACKUPS_DIR" ]] || return 0
+  [[ "$max" =~ ^[0-9]+$ ]] || max=30   # защита от некорректного значения
+  find "$SSHX_BACKUPS_DIR" -maxdepth 1 -name "*.conf.*" -mtime "+${max}" -delete 2>/dev/null || true
+}
+apply_ssh_flags() {
+  local file="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    local token="$1" flag val=""
+    if [[ "$token" == *=* ]]; then
+      flag="${token%%=*}"; val="${token#*=}"; flag="${flag#--}"; shift
+    else
+      flag="${token#--}"; shift
+      if [[ $# -gt 0 && "$1" != --* ]]; then val="$1"; shift; fi
+    fi
+    if [[ -n "${SSH_FLAG_MAP[$flag]:-}" ]]; then
+      update_ssh_directive "$file" "${SSH_FLAG_MAP[$flag]}" "$val"
+    else
+      warn "Unknown SSH option --${flag} (skipped)"
+    fi
+  done
+}
+cmd_connect() {
+  local dry_run=false name="" extra_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --help|-h) printf 'Usage: sshx connect [NAME] [SSH_ARGS...]\n\nOptions:\n  --dry-run  Print command without executing\n'; return ;;
+      -*) extra_args+=("$1"); shift ;;
+      *) [[ -z "$name" ]] && name="$1" || extra_args+=("$1"); shift ;;
+    esac
+  done
+  if [[ -z "$name" ]]; then
+    command -v fzf &>/dev/null || die "NAME required. Install fzf for interactive selection."
+    local fzf_opts=()
+    [[ "$(cfg_get fzf_preview)" == "true" ]] && fzf_opts+=(--preview "cat \"$SSHX_CONNECTIONS_DIR/{}.conf\" 2>/dev/null")
+    name=$(conn_files | xargs -I{} basename {} .conf | fzf --height=40% --reverse "${fzf_opts[@]}" 2>/dev/null) || die "No connection selected."
+  fi
+  local file; file=$(conn_file "$name")
+  [[ -f "$file" ]] || die "Connection '$name' not found."
+  local cmd=()
+  cmd+=("$SSH_BIN")
+  cmd+=("$name")
+  if [[ ${#extra_args[@]} -gt 0 ]]; then cmd+=("${extra_args[@]}"); fi
+  if $dry_run; then info "Would run: ${cmd[*]}"; return; fi
+  exec "${cmd[@]}"
+}
+cmd_list() {
+  local tag_filter=() format="table" sort_field="name" reverse=false no_header=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tag) tag_filter+=("$2"); shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      --sort) sort_field="$2"; shift 2 ;;
+      --reverse|-r) reverse=true; shift ;;
+      --no-header) no_header=true; shift ;;
+      --json) format="json"; shift ;;
+      --help|-h) printf 'Usage: sshx list [--tag TAG] [--format table|wide|json|ssh] [--sort name|host|port|created|updated] [--reverse] [--no-header]\n'; return ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+  local -a files=()
+  while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(conn_files)
+  [[ ${#files[@]} -gt 0 ]] || { info "No connections. Run 'sshx add NAME USER@HOST' to create one."; return; }
+  local -a rows=()
+  for f in "${files[@]}"; do
+    local raw name host port user desc tags created updated
+    raw=$(_parse_conn_file_fields "$f")
+    IFS=$'\t' read -r name host port user desc tags created updated <<< "$raw"
+    if [[ ${#tag_filter[@]} -gt 0 ]]; then
+      local match=true tf
+      for tf in "${tag_filter[@]}"; do [[ ",${tags}," == *",${tf},"* ]] || { match=false; break; }; done
+      $match || continue
+    fi
+    rows+=("${name}|${host}|${port}|${user}|${desc}|${tags}|${created}|${updated}")
+  done
+  [[ ${#rows[@]} -gt 0 ]] || { info "No connections match the filter."; return; }
+  local sort_col=0
+  case "$sort_field" in host) sort_col=1;; port) sort_col=2;; created) sort_col=6;; updated) sort_col=7;; esac
+  local sort_flags=("-t|" "-k$((sort_col+1))")
+  $reverse && sort_flags+=("-r")
+  IFS=$'\n' read -r -d '' -a rows < <(printf '%s\n' "${rows[@]}" | sort "${sort_flags[@]}" && printf '\0')
+  case "$format" in
+    json)
+      printf '[\n'
+      local first=true
+      for row in "${rows[@]}"; do
+        IFS='|' read -r n h po u d tg cr up <<< "$row"
+        $first || printf ',\n'
+        first=false
+        printf '  {"name":"%s","host":"%s","port":"%s","user":"%s","description":"%s","tags":"%s","created_at":"%s","updated_at":"%s"}' \
+          "$(json_escape "$n")" "$(json_escape "$h")" "$(json_escape "$po")" "$(json_escape "$u")" \
+          "$(json_escape "$d")" "$(json_escape "$tg")" "$(json_escape "$cr")" "$(json_escape "$up")"
+      done
+      printf '\n]\n'
+      ;;
+    ssh)
+      for row in "${rows[@]}"; do
+        IFS='|' read -r n h po u _ _ _ _ <<< "$row"
+        printf 'Host %s\n    HostName %s\n    Port %s\n' "$n" "$h" "$po"
+        [[ "$u" != "-" ]] && printf '    User %s\n' "$u"
+        printf '\n'
+      done
+      ;;
+    wide|*)
+      local header_line
+      if [[ "$format" == "wide" ]]; then
+        header_line='NAME\tHOST\tPORT\tUSER\tDESCRIPTION\tTAGS\tUPDATED'
+      else
+        header_line='NAME\tHOST\tPORT\tDESCRIPTION\tTAGS'
+      fi
+      {
+        $no_header || printf '%b\n' "$header_line"
+        for row in "${rows[@]}"; do
+          IFS='|' read -r n h po u d tg _ up <<< "$row"
+          if [[ "$format" == "wide" ]]; then printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$h" "$po" "$u" "$d" "$tg" "$up"
+          else printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$h" "$po" "$d" "$tg"; fi
+        done
+      } | if $no_header; then print_table --no-header; else print_table; fi
+      ;;
+  esac
+}
+cmd_search() {
+  local term="" field="any" regex=false format="table"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --field) field="$2"; shift 2 ;;
+      --regex) regex=true; shift ;;
+      --format) format="$2"; shift 2 ;;
+      --json) format="json"; shift ;;
+      --help|-h) printf 'Usage: sshx search TERM [--field name|host|user|desc|tag|any] [--regex] [--format table|json]\n'; return ;;
+      *) term="$1"; shift ;;
+    esac
+  done
+  [[ -n "$term" ]] || die "TERM required. Usage: sshx search TERM"
+  local -a results=()
+  while IFS= read -r f; do
+    local name host user desc tags haystack
+    name=$(conn_meta "$f" name); host=$(conn_ssh "$f" HostName)
+    user=$(conn_ssh "$f" User); desc=$(conn_meta "$f" description)
+    tags=$(conn_meta "$f" tags)
+    case "$field" in
+      name) haystack="$name" ;; host) haystack="$host" ;;
+      user) haystack="$user" ;; desc) haystack="$desc" ;;
+      tag) haystack="$tags" ;; *) haystack="$name $host $user $desc $tags" ;;
+    esac
+    local matched=false
+    if $regex; then
+      if [[ "$haystack" =~ $term ]]; then matched=true; fi
+    else
+      if [[ "$haystack" == *"$term"* ]]; then matched=true; fi
+    fi
+    $matched && results+=("${name}|${host}|${desc}|${tags}")
+  done < <(conn_files)
+  [[ ${#results[@]} -gt 0 ]] || { info "No connections match '${term}'."; return; }
+  if [[ "$format" == "json" ]]; then
+    printf '[\n'
+    local first=true
+    for r in "${results[@]}"; do
+      IFS='|' read -r n h d tg <<< "$r"
+      $first || printf ',\n'
+      first=false
+      printf '  {"name":"%s","host":"%s","description":"%s","tags":"%s"}' \
+        "$(json_escape "$n")" "$(json_escape "$h")" "$(json_escape "$d")" "$(json_escape "$tg")"
+    done
+    printf '\n]\n'
+  else
+    {
+      printf 'NAME\tHOST\tDESCRIPTION\tTAGS\n'
+      for r in "${results[@]}"; do
+        IFS='|' read -r n h d tg <<< "$r"
+        printf '%s\t%s\t%s\t%s\n' "$n" "$h" "$d" "$tg"
+      done
+    } | print_table
+  fi
+}
+_tags_sync() {
+  local name="$1" tags_str="$2"
+  _tags_remove_all "$name"
+  [[ -z "$tags_str" ]] && return
+  IFS=',' read -ra tag_arr <<< "$tags_str"
+  for tag in "${tag_arr[@]}"; do
+    tag="${tag//[[:space:]]/}"; [[ -z "$tag" ]] && continue
+    local tag_dir="$SSHX_TAGS_DIR/$tag"
+    mkdir -p "$tag_dir"
+    local abs_target
+    if [[ -d "$SSHX_CONNECTIONS_DIR" ]]; then
+      abs_target="$(cd "$SSHX_CONNECTIONS_DIR" && pwd -P)/${name}.conf"
+    else
+      abs_target="${SSHX_CONNECTIONS_DIR}/${name}.conf"
+    fi
+    ln -sf "$abs_target" "$tag_dir/${name}"
+  done
+}
+_tags_remove_all() {
+  [[ -d "$SSHX_TAGS_DIR" ]] || return 0
+  find "$SSHX_TAGS_DIR" -name "$1" -type l -delete 2>/dev/null || true
+  find "$SSHX_TAGS_DIR" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
+}
+cmd_tag_add() {
+  [[ $# -ge 2 ]] || die "Usage: sshx tag add NAME TAG[,TAG2,...]"
+  local name="$1" new_str="$2"
+  [[ -f "$(conn_file "$name")" ]] || die "Connection '$name' not found."
+  local file; file=$(conn_file "$name")
+  local current; current=$(conn_meta "$file" tags)
+  declare -A seen=()
+  local -a merged=()
+  local t arr1 arr2
+  IFS=',' read -ra arr1 <<< "$current"
+  IFS=',' read -ra arr2 <<< "$new_str"
+  for t in "${arr1[@]}" "${arr2[@]}"; do
+    t="${t//[[:space:]]/}"; [[ -z "$t" || -n "${seen[$t]:-}" ]] && continue
+    seen[$t]=1; merged+=("$t")
+  done
+  local result; result=$(IFS=','; printf '%s' "${merged[*]}")
+  check_lock
+  backup_conn "$file"
+  update_meta "$file" tags "$result"
+  touch_updated "$file"
+  _tags_sync "$name" "$result"
+  backups_prune
+  release_lock
+  ok "Tags for '${name}': ${result}"
+}
+cmd_tag_remove() {
+  [[ $# -ge 2 ]] || die "Usage: sshx tag remove NAME TAG[,TAG2,...]"
+  local name="$1" rm_str="$2"
+  [[ -f "$(conn_file "$name")" ]] || die "Connection '$name' not found."
+  local file; file=$(conn_file "$name")
+  local current; current=$(conn_meta "$file" tags)
+  declare -A drop=(); local t
+  IFS=',' read -ra rm_arr <<< "$rm_str"
+  for t in "${rm_arr[@]}"; do drop[${t//[[:space:]]/}]=1; done
+  local -a keep=()
+  IFS=',' read -ra existing <<< "$current"
+  for t in "${existing[@]}"; do
+    t="${t//[[:space:]]/}"; [[ -z "$t" || -n "${drop[$t]:-}" ]] && continue; keep+=("$t")
+  done
+  local result; result=$(IFS=','; printf '%s' "${keep[*]:-}")
+  check_lock
+  backup_conn "$file"
+  update_meta "$file" tags "$result"
+  touch_updated "$file"
+  _tags_sync "$name" "$result"
+  backups_prune
+  release_lock
+  ok "Tags for '${name}': ${result:-<none>}"
+}
+cmd_tag_list() {
+  declare -A counts=()
+  while IFS= read -r f; do
+    local tags; tags=$(conn_meta "$f" tags); [[ -z "$tags" ]] && continue
+    local t; IFS=',' read -ra arr <<< "$tags"
+    for t in "${arr[@]}"; do t="${t//[[:space:]]/}"; [[ -n "$t" ]] && counts[$t]=$(( ${counts[$t]:-0} + 1 )); done
+  done < <(conn_files)
+  [[ ${#counts[@]} -gt 0 ]] || { info "No tags found."; return; }
+  {
+    printf 'TAG\tCONNECTIONS\n'
+    local tag; for tag in $(printf '%s\n' "${!counts[@]}" | sort); do printf '%s\t%s\n' "$tag" "${counts[$tag]}"; done
+  } | print_table
+}
+cmd_tag_rename() {
+  [[ $# -ge 2 ]] || die "Usage: sshx tag rename OLD NEW"
+  local old="$1" new="$2" count=0
+  # Escape special sed BRE metacharacters
+  local old_esc new_esc
+  old_esc=$(printf '%s' "$old" | sed 's/[[\.*^$()+?{]/\\&/g')
+  new_esc=$(printf '%s' "$new" | sed 's/[\\&]/\\&/g')
+  check_lock
+  while IFS= read -r f; do
+    local tags; tags=$(conn_meta "$f" tags); [[ "$tags" == *"$old"* ]] || continue
+    local new_tags
+    new_tags=$(printf '%s' "$tags" | sed "s/\\(^\\|,\\)${old_esc}\\(,\\|$\\)/\\1${new_esc}\\2/g")
+    backup_conn "$f"
+    update_meta "$f" tags "$new_tags"
+    touch_updated "$f"
+    local cname; cname=$(conn_meta "$f" name)
+    _tags_sync "$cname" "$new_tags"
+    backups_prune
+    count=$((count+1))
+  done < <(conn_files)
+  release_lock
+  [[ $count -gt 0 ]] || warn "Tag '${old}' not found on any connection."
+  ok "Renamed tag '${old}' → '${new}' on ${count} connection(s)"
+}
+cmd_export() {
+  local all=false format="sshx"; local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=true; shift ;;
+      --format) format="$2"; shift 2 ;;
+      --help|-h) printf 'Usage:\n  sshx export NAME [FILE]\n  sshx export --all [FILE]\nOptions:\n  --format sshx|ssh\n'; return ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  if $all; then
+    local out="${pos[0]:-/dev/stdout}"
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    cp "$SSHX_CONNECTIONS_DIR"/*.conf "$tmp_dir/" 2>/dev/null || true
+    if [[ "$out" == "/dev/stdout" ]]; then tar -czf - -C "$tmp_dir" . 2>/dev/null
+    else tar -czf "$out" -C "$tmp_dir" .; ok "Exported all connections to '${out}'"; fi
+    rm -rf "$tmp_dir"; return
+  fi
+  local name="${pos[0]:-}" file="${pos[1]:-}"
+  [[ -n "$name" ]] || die "NAME required. Usage: sshx export NAME [FILE]"
+  [[ -f "$(conn_file "$name")" ]] || die "Connection '$name' not found."
+  local src; src=$(conn_file "$name")
+  if [[ "$format" == "ssh" ]]; then
+    if [[ -n "$file" ]]; then grep -v '^# sshx:' "$src" > "$file"; ok "Exported '${name}' (SSH) to '${file}'"; else grep -v '^# sshx:' "$src"; fi
+  else
+    if [[ -n "$file" ]]; then cp "$src" "$file"; ok "Exported '${name}' to '${file}'"; else cat "$src"; fi
+  fi
+}
+cmd_import() {
+  local file="" overwrite=false prefix=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --overwrite) overwrite=true; shift ;;
+      --prefix) prefix="$2"; shift 2 ;;
+      --help|-h) printf 'Usage: sshx import FILE [--overwrite] [--prefix PREFIX]\n'; return ;;
+      *) file="$1"; shift ;;
+    esac
+  done
+  [[ -n "$file" ]] || die "FILE required."
+  [[ -f "$file" ]] || die "File not found: ${file}"
+  local tmp_dir; tmp_dir=$(mktemp -d)
+  if file "$file" 2>/dev/null | grep -qiE "gzip|tar"; then
+    tar -xzf "$file" -C "$tmp_dir" 2>/dev/null
+  else
+    cp "$file" "$tmp_dir/"
+  fi
+  local imported=0
+  shopt -s nullglob
+  for f in "$tmp_dir"/*.conf "$tmp_dir"/*.config; do
+    [[ -f "$f" ]] || continue
+    local iname
+    iname=$(awk -F'=' '/^# sshx:name=/{print substr($0,index($0,"=")+1); exit}' "$f" 2>/dev/null || true)
+    [[ -z "$iname" ]] && iname=$(awk '/^Host /{print $2; exit}' "$f" 2>/dev/null || true)
+    [[ -z "$iname" || "$iname" == "*" ]] && continue
+    iname="${prefix}${iname}"
+    conn_validate_name "$iname" 2>/dev/null || { warn "Skipping invalid name: '${iname}'"; continue; }
+    local dest; dest=$(conn_file "$iname")
+    if [[ -f "$dest" ]] && ! $overwrite; then
+      warn "Skipping '${iname}' — already exists (use --overwrite)"; continue
+    fi
+    [[ -f "$dest" ]] && backup_conn "$dest"
+    mkdir -p "$(dirname "$dest")"
+    cp "$f" "$dest"; chmod 600 "$dest"
+    if [[ -n "$prefix" ]]; then
+      update_meta "$dest" name "$iname"
+      local tmp_pfx; tmp_pfx=$(mktemp); _TEMP_FILES+=("$tmp_pfx"); chmod 600 "$tmp_pfx"
+      awk -v n="$iname" '/^Host /{print "Host " n; next}{print}' "$dest" > "$tmp_pfx" && mv "$tmp_pfx" "$dest"
+      chmod 600 "$dest"
+    fi
+    _tags_sync "$iname" "$(conn_meta "$dest" tags)"
+    imported=$((imported+1))
+    ok "Imported '${iname}'"
+  done
+  shopt -u nullglob
+  rm -rf "$tmp_dir"
+  backups_prune
+  ok "Imported ${imported} connection(s)"
+}
+cmd_init() {
+  local force=false dry_run=false quiet=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      --dry-run) dry_run=true; shift ;;
+      --quiet|-q) quiet=true; shift ;;
+      --help|-h) printf 'Usage: sshx init [--force] [--dry-run] [--quiet]\nIdempotent — safe to run multiple times.'; return ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+  local include="Include $SSHX_CONNECTIONS_DIR/*.conf"
+  if $dry_run; then
+    info "Would create: ${SSHX_CONNECTIONS_DIR}/"
+    info "Would create: ${SSHX_TAGS_DIR}/"
+    info "Would create: ${SSHX_BACKUPS_DIR}/"
+    info "Would add to ${SSH_CONFIG}: ${include}"
+    return
+  fi
+  mkdir -p "$SSHX_CONNECTIONS_DIR" "$SSHX_TAGS_DIR" "$SSHX_BACKUPS_DIR"
+  touch "$SSHX_CONNECTIONS_DIR/.gitkeep"
+  chmod 700 "$SSHX_HOME" "$SSHX_CONNECTIONS_DIR" "$SSHX_TAGS_DIR" "$SSHX_BACKUPS_DIR"
+  $quiet || ok "Initialized ${SSHX_HOME}/"
+  mkdir -p "$SSH_HOME"; chmod 700 "$SSH_HOME"
+  touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+  if grep -qF "$include" "$SSH_CONFIG" 2>/dev/null && ! $force; then
+    $quiet || info "Include already present in ${SSH_CONFIG}"
+  else
+    $force && grep -qF "Include.*sshx" "$SSH_CONFIG" 2>/dev/null && {
+      local tmp; tmp=$(mktemp)
+      grep -v "Include.*sshx" "$SSH_CONFIG" > "$tmp"
+      mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+    }
+    local tmp; tmp=$(mktemp)
+    { printf '%s\n\n' "$include"; cat "$SSH_CONFIG"; } > "$tmp"
+    mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+    $quiet || ok "Added Include to ${SSH_CONFIG}"
+  fi
+}
+cmd_uninstall() {
+  local prefix="/usr/local" dry_run=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prefix) prefix="$2"; shift 2 ;;
+      --dry-run) dry_run=true; shift ;;
+      --help|-h) printf 'Usage: sshx uninstall [--prefix PREFIX] [--dry-run]\n'; return ;;
+      *) shift ;;
+    esac
+  done
+  if $dry_run; then info "Would remove: ${prefix}/bin/sshx"; return; fi
+  confirm "Remove sshx from ${prefix}/bin/sshx?" || { info "Aborted."; return; }
+  rm -f "${prefix}/bin/sshx"
+  ok "Removed ${prefix}/bin/sshx"
+  info "Data preserved at: ${SSHX_HOME}"
+  info "To remove data:    rm -rf ${SSHX_HOME}"
+}
+cmd_completion() {
+  local shell="${1:-}"
+  case "$shell" in
+    bash) _completion_bash ;;
+    zsh) _completion_zsh ;;
+    fish) _completion_fish ;;
+    --help|-h) printf 'Usage: sshx completion bash|zsh|fish\n' ;;
+    *) die "Unknown shell: '${shell}'. Supported: bash, zsh, fish" ;;
+  esac
+}
+_completion_bash() { cat <<'BASH'
+_sshx_connections() {
+  local d="${SSHX_HOME:-$HOME/.sshx}/connections"
+  [[ -d "$d" ]] || return; local f
+  for f in "$d"/*.conf; do [[ -f "$f" ]] && basename "$f" .conf; done
+}
+_sshx_complete() {
+  local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
+  local top="connect list search add show set rm rename copy check edit effective tag export import init config completion uninstall version help"
+  local conn_subs="add edit set remove show rename copy check effective"
+  local names; names="$(_sshx_connections)"
+  case "$cmd" in
+    connect|c) COMPREPLY=($(compgen -W "$names" -- "$cur")) ;;
+    show|info|set|update|rm|delete|rename|mv|copy|check|ping|edit|effective) COMPREPLY=($(compgen -W "$names" -- "$cur")) ;;
+    connection|conn)
+      [[ "$COMP_CWORD" -eq 2 ]] && COMPREPLY=($(compgen -W "$conn_subs" -- "$cur")) || COMPREPLY=($(compgen -W "$names" -- "$cur")) ;;
+    tag)
+      [[ "$COMP_CWORD" -eq 2 ]] && COMPREPLY=($(compgen -W "add remove list rename" -- "$cur")) || { [[ "$sub" != "list" ]] && COMPREPLY=($(compgen -W "$names" -- "$cur")); } ;;
+    export) COMPREPLY=($(compgen -W "--all $names" -- "$cur")) ;;
+    import) COMPREPLY=($(compgen -f -- "$cur")) ;;
+    config) [[ "$COMP_CWORD" -eq 2 ]] && COMPREPLY=($(compgen -W "set get" -- "$cur")) ;;
+    completion) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
+    *) [[ "$COMP_CWORD" -eq 1 ]] && COMPREPLY=($(compgen -W "$top" -- "$cur")) ;;
+  esac
+}
+complete -F _sshx_complete sshx
+BASH
+}
+_completion_zsh() { cat <<'ZSH'
+_sshx() {
+  local d="${SSHX_HOME:-$HOME/.sshx}/connections"
+  local -a names=()
+  [[ -d "$d" ]] && for f in "$d"/*.conf(N); do names+=("${f:t:r}"); done
+  local state
+  _arguments -C '1: :->cmd' '*: :->args'
+  case $state in
+    cmd) _values command connect list search add show set rm rename copy check edit effective tag export import init config completion uninstall version help ;;
+    args)
+      case ${words[2]} in
+        connect|c|show|info|set|update|rm|delete|rename|mv|copy|cp|check|ping|edit|effective)
+          _values connection "${names[@]}" ;;
+        connection|conn)
+          [[ ${#words[@]} -eq 3 ]] && _values subcommand add edit set remove show rename copy check effective || _values connection "${names[@]}" ;;
+        tag)
+          [[ ${#words[@]} -eq 3 ]] && _values subcommand add remove list rename || _values connection "${names[@]}" ;;
+        export) _values name --all "${names[@]}" ;;
+        import) _files ;;
+        config) _values subcommand set get ;;
+        completion) _values shell bash zsh fish ;;
+      esac ;;
+  esac
+}
+compdef _sshx sshx
+ZSH
+}
+_completion_fish() { cat <<'FISH'
+function __sshx_connections
+  set d (set -q SSHX_HOME; and echo $SSHX_HOME; or echo $HOME/.sshx)/connections
+  test -d $d; or return
+  for f in $d/*.conf; test -f $f; and basename $f .conf; end
+end
+set -l top_cmds "connect list search add show set rm rename copy check edit effective tag export import init config completion uninstall version help"
+complete -c sshx -f -n __fish_use_subcommand -a "$top_cmds"
+for cmd in connect c show set rm rename copy check edit effective
+  complete -c sshx -f -n "__fish_seen_subcommand_from $cmd" -a '(__sshx_connections)'
+end
+complete -c sshx -f -n '__fish_seen_subcommand_from tag' -a 'add remove list rename'
+complete -c sshx -f -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
+complete -c sshx -f -n '__fish_seen_subcommand_from import' -F
+FISH
+}
+cmd_help_brief() {
   cat <<EOF
-$(color bold)sshx$(color reset) — Advanced SSH Connection Manager v$SSHX_VERSION
-
+$(color bold)sshx$(color reset) — SSH Connection Manager v${SSHX_VERSION}
 $(color bold)Usage:$(color reset) sshx <command> [options]
 
-$(color bold)Connections:$(color reset)
-  $(color cyan)connect$(color reset)               NAME [SSH_ARGS...]     Connect to a saved host   (alias: ssh, c)
-  $(color cyan)search$(color reset)                TERM [options]         Search connections        (alias: find, f)
-  $(color cyan)list$(color reset)                  [options]              List all connections      (alias: ls)
-
-  $(color cyan)connection$(color reset) add        NAME USER@HOST[:PORT]  Create connection         (alias: new, create, a)
-  $(color cyan)connection$(color reset) edit       NAME                   Edit in \$EDITOR           (alias: e)
-  $(color cyan)connection$(color reset) set        NAME [options]         Update parameters         (alias: update, u)
-  $(color cyan)connection$(color reset) remove     NAME                   Delete connection         (alias: rm, delete, del)
-  $(color cyan)connection$(color reset) show       NAME                   Show details              (alias: info, i)
-  $(color cyan)connection$(color reset) rename     OLD NEW                Rename                    (alias: mv)
-  $(color cyan)connection$(color reset) copy       SOURCE NEW             Duplicate                 (alias: cp, clone)
-  $(color cyan)connection$(color reset) check      NAME                   Validate & ping           (alias: ping)
-  $(color cyan)connection$(color reset) effective  NAME                   Show effective SSH config (alias: config, cfg)
+$(color bold)Quick commands:$(color reset)
+  $(color cyan)add$(color reset)     [NAME] USER@HOST[:PORT]   Create connection
+  $(color cyan)show$(color reset)    NAME                       Show details
+  $(color cyan)set$(color reset)     NAME [options]             Update parameters
+  $(color cyan)rm$(color reset)      NAME [--force]             Delete connection
+  $(color cyan)rename$(color reset)  OLD NEW                    Rename
+  $(color cyan)copy$(color reset)    SOURCE NEW                 Duplicate
+  $(color cyan)connect$(color reset) NAME [SSH_ARGS...]         Connect (alias: c)
+  $(color cyan)list$(color reset)    [options]                  List all (alias: ls)
+  $(color cyan)search$(color reset)  TERM [options]             Search
+  $(color cyan)check$(color reset)   NAME [--config-only]       Validate & ping
+  $(color cyan)edit$(color reset)    NAME                       Open in \$EDITOR
+  $(color cyan)effective$(color reset) NAME                     Show resolved config
 
 $(color bold)Tags:$(color reset)
-  $(color cyan)tag$(color reset) add               TAG[,TAG2]             Add tags to connection
-  $(color cyan)tag$(color reset) remove            NAME TAG[,TAG2]        Remove tags from connection
-  $(color cyan)tag$(color reset) list                                     List all tags with counts
-  $(color cyan)tag$(color reset) rename            OLD NEW                Rename tag everywhere
+  $(color cyan)tag add$(color reset)     NAME TAG[,TAG2]
+  $(color cyan)tag remove$(color reset)  NAME TAG[,TAG2]
+  $(color cyan)tag list$(color reset)
+  $(color cyan)tag rename$(color reset)  OLD NEW
 
-$(color bold)Transfers:$(color reset)
-  $(color cyan)export$(color reset)                NAME [FILE]            Export one connection
-  $(color cyan)export$(color reset) --all          FILE                   Export all connections
-  $(color cyan)import$(color reset)                [FILE]                 Import connections
+$(color bold)Transfer:$(color reset)
+  $(color cyan)export$(color reset)      NAME [FILE] | --all [FILE]
+  $(color cyan)import$(color reset)      FILE [--prefix PREFIX] [--overwrite]
 
-$(color bold)Base:$(color reset)
-  $(color cyan)init$(color reset)                                         Initialize ~/.sshx
-  $(color cyan)config$(color reset) set            KEY VALUE              Set sshx setting
-  $(color cyan)config$(color reset) get            [KEY]                  Show sshx setting(s)
-  $(color cyan)completion$(color reset)            bash|zsh|fish          Print completion script
-  $(color cyan)version$(color reset)                                      Show version
-  $(color cyan)license$(color reset)                                      Show license
-  $(color cyan)help$(color reset)                                         Show help
+$(color bold)System:$(color reset)
+  $(color cyan)init$(color reset)        [--force] [--dry-run] [--quiet]
+  $(color cyan)config$(color reset)      set KEY VALUE | get [KEY]
+  $(color cyan)completion$(color reset)  bash|zsh|fish
+  $(color cyan)uninstall$(color reset)   [--prefix PREFIX]
+  $(color cyan)exec$(color reset)        [--parallel] HOST|tag:TAG COMMAND
 
-Run $(color bold)sshx COMMAND --help$(color reset) for command-specific help.
+For full documentation: $(color cyan)sshx help$(color reset)
 EOF
 }
+cmd_help_full() {
+  cat <<EOF
+$(color bold)sshx$(color reset) — SSH Connection Manager v${SSHX_VERSION}
+$(color bold)Full documentation$(color reset)
 
-cmd_version() {
-  echo "$SSHX_VERSION"
+$(color bold)CORE COMMANDS$(color reset)
+  $(color cyan)add$(color reset)      Create a new connection
+    $(color gray)Example:$(color reset) sshx add myserver user@example.com:2222 -d "My server" -t prod
+    Options:
+      -d, --description TEXT   Connection description
+      -t, --tags TAG1,TAG2     Comma-separated tags
+      --force                  Overwrite existing connection
+      --<ssh-option> VALUE     Any SSH option (e.g., --identity ~/.ssh/id_rsa)
+
+  $(color cyan)set$(color reset)      Modify connection parameters
+    $(color gray)Example:$(color reset) sshx set myserver --port 2222 --tags prod,db
+    Options:
+      -d, --description TEXT   Change description
+      -t, --tags TAG1,TAG2     Replace tags
+      --remove DIRECTIVE       Remove an SSH directive (e.g., Port)
+      --add DIRECTIVE VALUE    Add a raw SSH directive
+      --<ssh-option> VALUE     Set any SSH option
+
+  $(color cyan)show$(color reset)     Show connection details
+    $(color gray)Example:$(color reset) sshx show myserver --format json
+    Options:
+      --format pretty|raw|json  Output format
+
+  $(color cyan)rm$(color reset)       Delete a connection
+    $(color gray)Example:$(color reset) sshx rm myserver --force
+    Options:
+      --force       Skip confirmation
+      --no-backup   Do not create a backup
+
+  $(color cyan)rename$(color reset)   Rename a connection
+    $(color gray)Example:$(color reset) sshx rename myserver my-server
+
+  $(color cyan)copy$(color reset)     Duplicate a connection
+    $(color gray)Example:$(color reset) sshx copy myserver myserver-backup
+
+  $(color cyan)connect$(color reset)  Connect via SSH (alias: c)
+    $(color gray)Example:$(color reset) sshx connect myserver -v
+    Options:
+      --dry-run     Show command without executing
+      [SSH_ARGS]    Extra arguments for ssh
+
+  $(color cyan)list$(color reset)     List connections (alias: ls)
+    $(color gray)Example:$(color reset) sshx list --tag prod --format json
+    Options:
+      --tag TAG     Filter by tag
+      --sort field  Sort by (name,host,port,created,updated)
+      --reverse     Reverse order
+      --format table|wide|json|ssh  Output format
+      --no-header   Omit header
+
+  $(color cyan)search$(color reset)   Search connections
+    $(color gray)Example:$(color reset) sshx search example --field host
+    Options:
+      --field name|host|user|desc|tag|any  Field to search
+      --regex       Use regular expression
+      --format table|json
+
+  $(color cyan)check$(color reset)    Validate configuration and connectivity
+    $(color gray)Example:$(color reset) sshx check myserver --timeout 5
+    Options:
+      --config-only Only check config (ssh -G)
+      --timeout N   Connection timeout in seconds
+
+  $(color cyan)edit$(color reset)     Open in editor (EDITOR)
+    $(color gray)Example:$(color reset) sshx edit myserver
+
+  $(color cyan)effective$(color reset) Show effective configuration (ssh -G)
+    $(color gray)Example:$(color reset) sshx effective myserver
+
+$(color bold)TAGS$(color reset)
+  $(color cyan)tag add$(color reset)      Add tags to a connection
+    $(color gray)Example:$(color reset) sshx tag add myserver db,cache
+  $(color cyan)tag remove$(color reset)   Remove tags
+    $(color gray)Example:$(color reset) sshx tag remove myserver db
+  $(color cyan)tag list$(color reset)     Show all tags and connection counts
+  $(color cyan)tag rename$(color reset)   Rename a tag across all connections
+    $(color gray)Example:$(color reset) sshx tag rename old new
+
+$(color bold)EXPORT / IMPORT$(color reset)
+  $(color cyan)export$(color reset)       Export connection(s)
+    $(color gray)Example:$(color reset) sshx export myserver my.conf
+    $(color gray)Example:$(color reset) sshx export --all backup.tar.gz
+    Options:
+      --format sshx|ssh   Format (sshx includes metadata, ssh is raw config)
+  $(color cyan)import$(color reset)       Import from file or archive
+    $(color gray)Example:$(color reset) sshx import backup.tar.gz --prefix imported_
+    Options:
+      --prefix PREFIX   Add prefix to imported connection names
+      --overwrite       Overwrite existing connections
+
+$(color bold)SYSTEM$(color reset)
+  $(color cyan)init$(color reset)         Initialize environment
+    $(color gray)Example:$(color reset) sshx init --quiet
+    Options:
+      --force     Force add Include even if already present
+      --dry-run   Show what would be done
+      --quiet     Minimal output
+
+  $(color cyan)config$(color reset)       Manage settings
+    $(color gray)Example:$(color reset) sshx config set editor vim
+    Subcommands:
+      get [KEY]       Get value (all if key omitted)
+      set KEY VALUE   Set value
+    Keys: editor, backup_enabled, backup_max_age_days, color, fzf_preview, default_tags
+
+  $(color cyan)completion$(color reset)   Generate shell completion
+    $(color gray)Example:$(color reset) sshx completion bash > ~/.bash_completion.d/sshx
+    Supported shells: bash, zsh, fish
+
+  $(color cyan)uninstall$(color reset)    Remove the script (data preserved)
+    $(color gray)Example:$(color reset) sshx uninstall --dry-run
+    Options:
+      --prefix DIR   Installation prefix (default /usr/local)
+
+  $(color cyan)exec$(color reset)         Execute command on one or more hosts
+    $(color gray)Example:$(color reset) sshx exec --parallel tag:prod 'uptime'
+    Options:
+      --parallel    Run in parallel on all hosts
+      tag:TAG       Run on all hosts with given tag
+      HOST          Run on a single host
+
+  $(color cyan)version$(color reset)      Show version
+  $(color cyan)license$(color reset)      Show license (GPL-3.0)
+
+$(color bold)SUBCOMMAND HELP$(color reset)
+  $(color gray)sshx connection --help$(color reset)     Help for connection management
+  $(color gray)sshx tag --help$(color reset)           Help for tags
+  $(color gray)sshx config --help$(color reset)        Help for configuration
+
+$(color bold)ENVIRONMENT VARIABLES$(color reset)
+  SSHX_HOME      Data directory (default ~/.sshx)
+  SSH_HOME       User .ssh directory (default ~/.ssh)
+  SSH_BIN        ssh command (default ssh)
+  NO_COLOR       Disable colors (any value)
+  FORCE_COLOR    Force colors even if not a terminal
+
+$(color bold)AUTHOR$(color reset)
+  https://github.com/yourname/sshx   (replace with actual URL)
+EOF
 }
+_dispatch_connection() {
+  local sub="${1:-}"; shift || true
+  if [[ -z "$sub" || "$sub" == "--help" || "$sub" == "-h" ]]; then
+    cat <<EOF
+Connection management: sshx connection <subcommand>
 
-cmd_license() {
-  echo "$SSHX_LISENCE"
+Subcommands:
+  add       Create a new connection
+  edit      Edit in editor
+  set       Modify parameters
+  remove    Delete (rm, del)
+  show      Show details
+  rename    Rename
+  copy      Duplicate
+  check     Validate
+  effective Show effective config
+
+For help on a specific subcommand: sshx connection <subcommand> --help
+EOF
+    return 0
+  fi
+  case "$sub" in
+    add|new|create|a) cmd_connection_add "$@" ;;
+    edit|e) cmd_connection_edit "$@" ;;
+    set|update|u) cmd_connection_set "$@" ;;
+    remove|rm|delete|del) cmd_connection_remove "$@" ;;
+    show|info|i) cmd_connection_show "$@" ;;
+    rename|mv) cmd_connection_rename "$@" ;;
+    copy|cp|clone) cmd_connection_copy "$@" ;;
+    check|ping|validate) cmd_connection_check "$@" ;;
+    effective|cfg) cmd_connection_effective "$@" ;;
+    *) die "Unknown connection subcommand: '${sub}'. Run 'sshx connection --help'." ;;
+  esac
 }
+cmd_connection_add() {
+  local description="" tags="" force=false
+  local -a ssh_extras=() pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --description|-d) description="$2"; shift 2 ;;
+      --tags|-t) tags="$2"; shift 2 ;;
+      --force|-f) force=true; shift ;;
+      --help|-h) printf 'Usage: sshx add [NAME] USER@HOST[:PORT] [options]\n\nOptions:\n  -d, --description TEXT\n  -t, --tags TAG1,TAG2\n  --force\n  --<ssh-param> VALUE\n'; return ;;
+      --*=*) local _f="${1%%=*}"; ssh_extras+=("${_f#--}" "${1#*=}"); shift ;;
+      --*) 
+        if [[ $# -ge 2 ]]; then
+          ssh_extras+=("${1#--}" "$2"); shift 2
+        else
+          die "Option --${1#--} requires a value"
+        fi
+        ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  local name="" conn_str=""
+  case "${#pos[@]}" in
+    0) die "USER@HOST[:PORT] required." ;;
+    1) conn_str="${pos[0]}" ;;
+    *) name="${pos[0]}"; conn_str="${pos[1]}" ;;
+  esac
+  if [[ -z "$name" ]]; then
+    local _u _h _p; parse_conn_string "$conn_str" _u _h _p
+    name="${_h%%.*}"; name="${name//[^a-zA-Z0-9._-]/-}"
+  fi
+  conn_validate_name_or_die "$name"
+  mkdir -p "$SSHX_CONNECTIONS_DIR"
+  local file; file=$(conn_file "$name")
+  if [[ -f "$file" ]] && ! $force; then die "Connection '${name}' already exists. Use --force to overwrite."; fi
+  check_lock
+  backup_conn "$file"
+  write_conn_file "$file" "$name" "$conn_str" "$description" "$tags"
+  if [[ ${#ssh_extras[@]} -gt 0 ]]; then apply_ssh_flags "$file" "${ssh_extras[@]}"; fi
+  _tags_sync "$name" "$(conn_meta "$file" tags)"
+  backups_prune
+  release_lock
+  ok "Created connection '${name}' → ${conn_str}"
+}
+cmd_connection_set() {
+  if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    cat <<EOF
+Usage: sshx set NAME [options]
 
+Options:
+  --description, -d TEXT    Set description
+  --tags, -t TAG1,TAG2      Replace tags
+  --remove DIRECTIVE        Remove an SSH directive (e.g., Port)
+  --add DIRECTIVE VALUE     Add a raw SSH directive
+  --<ssh-option> VALUE      Set any SSH option (e.g., --identity=file)
+EOF
+    return 0
+  fi
+  [[ $# -ge 1 ]] || die "Usage: sshx set NAME [options]"
+  local name="$1"; shift
+  conn_validate_name_or_die "$name"
+  local file; file=$(conn_file "$name")
+  [[ -f "$file" ]] || die "Connection '$name' not found."
+  check_lock
+  backup_conn "$file"
+  local description="" tags=""
+  local -a to_remove=() to_add=() ssh_flags=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --description|-d) description="$2"; shift 2 ;;
+      --tags|-t) tags="$2"; shift 2 ;;
+      --remove) to_remove+=("$2"); shift 2 ;;
+      --add) to_add+=("$2" "$3"); shift 3 ;;
+      --*=*) local _f="${1%%=*}"; ssh_flags+=("${_f#--}" "${1#*=}"); shift ;;
+      --*) 
+        if [[ $# -ge 2 ]]; then
+          ssh_flags+=("${1#--}" "$2"); shift 2
+        else
+          die "Option --${1#--} requires a value"
+        fi
+        ;;
+      *) die "Unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$description" ]] && update_meta "$file" description "$description"
+  if [[ -n "$tags" ]]; then update_meta "$file" tags "$tags"; _tags_sync "$name" "$tags"; fi
+  local param; for param in "${to_remove[@]}"; do remove_ssh_directive "$file" "$param"; done
+  local i=0
+  if [[ ${#to_add[@]} -gt 0 ]]; then
+    local tmp_add; tmp_add=$(mktemp); _TEMP_FILES+=("$tmp_add"); chmod 600 "$tmp_add"
+    cp "$file" "$tmp_add"
+    while [[ $i -lt ${#to_add[@]} ]]; do
+      printf '    %s %s\n' "${to_add[$i]}" "${to_add[$((i+1))]}" >> "$tmp_add"
+      i=$((i+2))
+    done
+    mv "$tmp_add" "$file"; chmod 600 "$file"
+  fi
+  if [[ ${#ssh_flags[@]} -gt 0 ]]; then apply_ssh_flags "$file" "${ssh_flags[@]}"; fi
+  touch_updated "$file"
+  backups_prune
+  release_lock
+  ok "Updated connection '${name}'"
+}
+cmd_connection_show() {
+  [[ $# -ge 1 ]] || die "Usage: sshx show NAME"
+  local name="$1" format="pretty"; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format) format="$2"; shift 2 ;;
+      --json) format="json"; shift ;;
+      --help|-h) printf 'Usage: sshx show NAME [--format pretty|raw|json]\n'; return ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+  local file; file=$(conn_file "$name")
+  [[ -f "$file" ]] || die "Connection '$name' not found."
+  case "$format" in
+    raw) cat "$file" ;;
+    json)
+      local n h po u d tg cr up cs
+      n=$(conn_meta "$file" name); h=$(conn_ssh "$file" HostName)
+      po=$(conn_ssh "$file" Port); [[ -n "$po" ]] || po="22"
+      u=$(conn_ssh "$file" User); d=$(conn_meta "$file" description)
+      tg=$(conn_meta "$file" tags); cr=$(conn_meta "$file" created_at)
+      up=$(conn_meta "$file" updated_at); cs=$(conn_meta "$file" connection_string)
+      printf '{"name":"%s","host":"%s","port":"%s","user":"%s","description":"%s","tags":"%s","created_at":"%s","updated_at":"%s","connection_string":"%s"}\n' \
+        "$(json_escape "$n")" "$(json_escape "$h")" "$(json_escape "$po")" "$(json_escape "$u")" \
+        "$(json_escape "$d")" "$(json_escape "$tg")" "$(json_escape "$cr")" "$(json_escape "$up")" \
+        "$(json_escape "$cs")"
+      ;;
+    *)
+      local n h po u d tg cr up
+      n=$(conn_meta "$file" name); h=$(conn_ssh "$file" HostName)
+      po=$(conn_ssh "$file" Port); [[ -n "$po" ]] || po="22"
+      u=$(conn_ssh "$file" User); d=$(conn_meta "$file" description)
+      tg=$(conn_meta "$file" tags); cr=$(conn_meta "$file" created_at)
+      up=$(conn_meta "$file" updated_at)
+      printf '%s%-18s%s %s\n' "$(color bold)" "Name:" "$(color reset)" "$n"
+      printf '%-18s %s\n' "Host:" "$h"; printf '%-18s %s\n' "Port:" "$po"
+      [[ -n "$u" ]] && printf '%-18s %s\n' "User:" "$u"
+      [[ -n "$d" ]] && printf '%-18s %s\n' "Description:" "$d"
+      [[ -n "$tg" ]] && printf '%-18s %s\n' "Tags:" "$tg"
+      [[ -n "$cr" ]] && printf '%-18s %s\n' "Created:" "$cr"
+      [[ -n "$up" ]] && printf '%-18s %s\n' "Updated:" "$up"
+      printf '\n%s--- SSH Config ---%s\n' "$(color gray)" "$(color reset)"
+      grep -v '^# sshx:' "$file" | grep -v '^[[:space:]]*$'
+      ;;
+  esac
+}
+cmd_connection_rename() {
+  [[ $# -ge 2 ]] || die "Usage: sshx rename OLD NEW"
+  local old="$1" new="$2"
+  if [[ ! -f "$(conn_file "$old")" ]]; then die "Connection '$old' not found."; fi
+  conn_validate_name_or_die "$new"
+  check_lock
+  local old_file; old_file=$(conn_file "$old")
+  local new_file; new_file=$(conn_file "$new")
+  [[ ! -f "$new_file" ]] || die "Connection '${new}' already exists."
+  backup_conn "$old_file"
+  local tmp; tmp=$(mktemp); chmod 600 "$tmp"
+  awk -v o="$old" -v n="$new" 'BEGIN{FS=OFS="="} /^# sshx:name=/{print "# sshx:name=" n; next} {print}' "$old_file" > "$tmp"
+  awk -v o="$old" -v n="$new" '/^Host /{if($2==o){print "Host " n; next}} {print}' "$tmp" > "$new_file"
+  chmod 600 "$new_file"
+  rm -f "$old_file"
+  _tags_remove_all "$old"
+  _tags_sync "$new" "$(conn_meta "$new_file" tags)"
+  touch_updated "$new_file"
+  backups_prune
+  release_lock
+  ok "Renamed '${old}' → '${new}'"
+}
+cmd_connection_copy() {
+  [[ $# -ge 2 ]] || die "Usage: sshx copy SOURCE NEW"
+  local src="$1" new="$2"; shift 2
+  [[ -f "$(conn_file "$src")" ]] || die "Connection '$src' not found."
+  conn_validate_name_or_die "$new"
+  local src_file; src_file=$(conn_file "$src")
+  local new_file; new_file=$(conn_file "$new")
+  [[ ! -f "$new_file" ]] || die "Connection '${new}' already exists."
+  check_lock
+  local now; now=$(utc_now)
+  local tmp; tmp=$(mktemp); chmod 600 "$tmp"
+  awk -v n="$new" -v now="$now" 'BEGIN{FS=OFS="="} /^# sshx:name=/{print "# sshx:name=" n; next} /^# sshx:created_at=/{print "# sshx:created_at=" now; next} /^# sshx:updated_at=/{print "# sshx:updated_at=" now; next} {print}' "$src_file" > "$tmp"
+  awk -v s="$src" -v n="$new" '/^Host /{if($2==s){$2=n; print; next}} {print}' "$tmp" > "$new_file"
+  chmod 600 "$new_file"
+  if [[ $# -gt 0 ]]; then cmd_connection_set "$new" "$@" 2>/dev/null || true; fi
+  _tags_sync "$new" "$(conn_meta "$new_file" tags)"
+  backups_prune
+  release_lock
+  ok "Copied '${src}' → '${new}'"
+}
+cmd_connection_remove() {
+  [[ $# -ge 1 ]] || die "Usage: sshx rm NAME"
+  local name="$1" force=false no_backup=false; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force|-f) force=true; shift ;;
+      --no-backup) no_backup=true; shift ;;
+      --help|-h) printf 'Usage: sshx rm NAME [--force] [--no-backup]\n'; return ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+  local file; file=$(conn_file "$name")
+  [[ -f "$file" ]] || die "Connection '$name' not found."
+  $force || confirm "Delete connection '${name}'?" || { info "Aborted."; return; }
+  check_lock
+  $no_backup || backup_conn "$file"
+  rm -f "$file"
+  _tags_remove_all "$name"
+  backups_prune
+  release_lock
+  ok "Removed connection '${name}'"
+}
+cmd_connection_check() {
+  [[ $# -ge 1 ]] || die "Usage: sshx check NAME"
+  local name="$1" config_only=false timeout=5; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config-only) config_only=true; shift ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --help|-h) printf 'Usage: sshx check NAME [--config-only] [--timeout N]\n'; return ;;
+      *) die "Unknown flag: $1" ;;
+    esac
+  done
+  local file; file=$(conn_file "$name")
+  [[ -f "$file" ]] || die "Connection '$name' not found."
+  if "$SSH_BIN" -G "$name" &>/dev/null; then ok "Config valid (ssh -G passed)"; else die "Config invalid — run '${SSH_BIN} -G ${name}' for details."; fi
+  $config_only && return
+  info "Testing connectivity (timeout ${timeout}s)…"
+  if "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout="$timeout" -o StrictHostKeyChecking=accept-new "$name" exit 0 &>/dev/null; then ok "Connection successful"; else warn "Could not connect (unreachable or requires interactive auth)"; fi
+}
+cmd_connection_edit() {
+  [[ $# -ge 1 ]] || die "Usage: sshx edit NAME"
+  local name="$1"; shift
+  local file; file=$(conn_file "$name")
+  [[ -f "$file" ]] || die "Connection '$name' not found."
+  check_lock
+  backup_conn "$file"
+  release_lock
+  "$(cfg_get editor)" "$file"
+  check_lock
+  touch_updated "$file"
+  backups_prune
+  release_lock
+  "$SSH_BIN" -G "$name" &>/dev/null && ok "Saved. Config valid." || warn "SSH config syntax error. Check with: ${SSH_BIN} -G ${name}"
+}
+cmd_connection_effective() {
+  [[ $# -ge 1 ]] || die "Usage: sshx effective NAME"
+  if [[ ! -f "$(conn_file "$1")" ]]; then die "Connection '$1' not found."; fi
+  "$SSH_BIN" -G "$1"
+}
+cmd_exec() {
+  if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    cat <<EOF
+Usage: sshx exec [--parallel] HOST|tag:TAG COMMAND
+
+Execute a command on one or more hosts.
+
+Options:
+  --parallel    Run command in parallel on all hosts
+
+Examples:
+  sshx exec myserver 'uptime'
+  sshx exec --parallel tag:prod 'df -h'
+EOF
+    return 0
+  fi
+  local parallel=false
+  if [[ "${1:-}" == "--parallel" ]]; then parallel=true; shift; fi
+  [[ $# -ge 2 ]] || die "Usage: sshx exec [--parallel] HOST|tag:TAG COMMAND"
+  local target="$1"; shift
+  local cmd="$*"
+  local -a hosts=()
+  if [[ "$target" == tag:* ]]; then
+    local tag="${target#tag:}"
+    if [[ -d "$SSHX_TAGS_DIR/$tag" ]]; then
+      local l
+      for l in "$SSHX_TAGS_DIR/$tag"/*; do [[ -L "$l" ]] || continue; hosts+=("$(basename "$l")"); done
+    else
+      die "Tag not found: $tag"
+    fi
+  else
+    hosts+=("$target")
+  fi
+  [[ ${#hosts[@]} -gt 0 ]] || die "No hosts found for target: $target"
+  if $parallel; then
+    local -a pids=() tmpfiles=() hostnames=()
+    local h tmpfile
+    for h in "${hosts[@]}"; do
+      tmpfile=$(mktemp "$SSHX_HOME/exec.XXXXXX")
+      _TEMP_FILES+=("$tmpfile")
+      ("$SSH_BIN" "$h" -- sh -c "$cmd") >"$tmpfile" 2>&1 &
+      pids+=("$!")
+      tmpfiles+=("$tmpfile")
+      hostnames+=("$h")
+    done
+    local i
+    for i in "${!pids[@]}"; do
+      wait "${pids[$i]}" 2>/dev/null || true
+      printf '--- %s ---\n' "${hostnames[$i]}"
+      cat "${tmpfiles[$i]}"
+      rm -f "${tmpfiles[$i]}"
+    done
+  else
+    local h
+    for h in "${hosts[@]}"; do
+      printf '--- %s ---\n' "$h"
+      "$SSH_BIN" "$h" -- sh -c "$cmd"
+    done
+  fi
+}
 main() {
-  local cmd="${1:-help}"
-  shift || true
-
+  local cmd="${1:-help}"; shift || true
   case "$cmd" in
-    # Top-level verbs
-    connect|c)		cmd_connect "$@" 	  ;;
-    check|ping)		cmd_connection_check "$@" ;;
-    list|ls)            cmd_list "$@" 		  ;;
-    search|find|f)      cmd_search "$@" 	  ;;
-
-    # connection sub-group
-    connection|conn)
-      local sub="${1:-}"
-      shift || true
-      case "$sub" in
-        add|new|create|a)  cmd_connection_add "$@" ;;
-        edit|e)            cmd_connection_edit "$@" ;;
-        set|update|u)      cmd_connection_set "$@" ;;
-        remove|rm|delete|del) cmd_connection_remove "$@" ;;
-        show|info|i)       cmd_connection_show "$@" ;;
-        rename|mv)         cmd_connection_rename "$@" ;;
-        copy|cp|clone)     cmd_connection_copy "$@" ;;
-        check|validate|ping|v) cmd_connection_check "$@" ;;
-        effective|config|cfg)  cmd_connection_effective "$@" ;;
-        --help|-h)         cmd_help ;;
-        *) die "Unknown connection subcommand: '$sub'. Run 'sshx help'." ;;
-      esac
+    help|--help|-h)
+      if [[ "$cmd" == "help" ]]; then
+        cmd_help_full
+      else
+        cmd_help_brief
+      fi
       ;;
-      
-
-    # tag sub-group
+    connect|c|ssh) cmd_connect "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    search|find|f) cmd_search "$@" ;;
+    add|new|create|a) cmd_connection_add "$@" ;;
+    show|info|i) cmd_connection_show "$@" ;;
+    set|update|u) cmd_connection_set "$@" ;;
+    rm|remove|delete|del) cmd_connection_remove "$@" ;;
+    rename|mv) cmd_connection_rename "$@" ;;
+    copy|cp|clone) cmd_connection_copy "$@" ;;
+    check|ping) cmd_connection_check "$@" ;;
+    edit|e) cmd_connection_edit "$@" ;;
+    effective|cfg) cmd_connection_effective "$@" ;;
+    connection|conn) _dispatch_connection "$@" ;;
     tag)
-      local sub="${1:-}"
-      shift || true
+      local sub="${1:-}"; shift || true
+      if [[ -z "$sub" || "$sub" == "--help" || "$sub" == "-h" ]]; then
+        cat <<EOF
+Tag management: sshx tag <subcommand>
+
+Subcommands:
+  add    NAME TAG[,TAG2...]   Add tags to a connection
+  remove NAME TAG[,TAG2...]   Remove tags from a connection
+  list                        Show all tags
+  rename OLD NEW              Rename a tag across all connections
+
+For help on a specific subcommand: sshx tag <subcommand> --help
+EOF
+        return 0
+      fi
       case "$sub" in
-        add)     cmd_tag_add "$@" ;;
-        remove)  cmd_tag_remove "$@" ;;
-        list)    cmd_tag_list "$@" ;;
-        rename)  cmd_tag_rename "$@" ;;
-        --help|-h) cmd_help ;;
-        *) die "Unknown tag subcommand: '$sub'. Run 'sshx help'." ;;
-      esac
-      ;;
-
-    # import/export
-    export)  cmd_export "$@" ;;
-    import)  cmd_import "$@" ;;
-
-    # config
+        add) cmd_tag_add "$@" ;;
+        remove) cmd_tag_remove "$@" ;;
+        list) cmd_tag_list "$@" ;;
+        rename) cmd_tag_rename "$@" ;;
+        *) die "Unknown tag subcommand: '${sub}'." ;;
+      esac ;;
+    export) cmd_export "$@" ;;
+    import) cmd_import "$@" ;;
+    init) cmd_init "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
     config)
-      local sub="${1:-get}"
-      shift || true
+      local sub="${1:-get}"; shift || true
+      if [[ -z "$sub" || "$sub" == "--help" || "$sub" == "-h" ]]; then
+        cat <<EOF
+Configuration management: sshx config <subcommand>
+
+Subcommands:
+  get [KEY]   Get value (all if key omitted)
+  set KEY VALUE Set value
+
+Keys: editor, backup_enabled, backup_max_age_days, color, fzf_preview, default_tags
+EOF
+        return 0
+      fi
       case "$sub" in
         set) cmd_config_set "$@" ;;
         get) cmd_config_get "$@" ;;
-        --help|-h) cmd_help ;;
-        *) die "Unknown config subcommand: '$sub'." ;;
-      esac
-      ;;
-
-    # misc
-    init)        cmd_init "$@" 			;;
-    completion)  cmd_completion "$@" 		;;
-    version|--version|-V) cmd_version 		;;
-    license|--lisence|-L) cmd_license "$@"	;;
-    help|--help|-h) cmd_help 			;;
-    *) die "Unknown command: '$cmd'. Run 'sshx help'." ;;
+        *) die "Unknown config subcommand: '${sub}'." ;;
+      esac ;;
+    completion) cmd_completion "$@" ;;
+    exec) cmd_exec "$@" ;;
+    version|--version|-V) printf '%s\n' "$SSHX_VERSION" ;;
+    license|--license|-L) printf '%s\n' "$SSHX_LICENSE" ;;
+    *) die "Unknown command: '${cmd}'. Run 'sshx help'." ;;
   esac
 }
-
 main "$@"
